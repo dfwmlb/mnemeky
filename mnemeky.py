@@ -6,77 +6,125 @@
 # - pretty fomatting
 # - new event updating and handling
 # - upcoming events
+# - push notifications
 
-from __future__ import print_function
-import httplib2
-
-import datetime
-import time
+import sqlite3
 import config
-import telebot
+import httplib2
+import datetime
 import schedule
+import time
+import telebot
 
-from apiclient import discovery
 from oauth2client.service_account import ServiceAccountCredentials
+from apiclient import discovery
+from datetime import datetime as dt
 from telebot import apihelper
 
+onoma = 'mnemeky'
+
 apihelper.proxy = {'https': 'socks5://localhost:9050'}
+bot = telebot.TeleBot(config.tg_token)
 
-def job():
-    print("I'm working...")
-    bot = telebot.TeleBot(config.tg_token)
+credentials = ServiceAccountCredentials.from_json_keyfile_name(
+    config.client_secret_calendar, 'https://www.googleapis.com/auth/calendar.readonly')
+http = credentials.authorize(httplib2.Http())
+service = discovery.build('calendar', 'v3', http=http)
 
-    def main():
-        credentials = ServiceAccountCredentials.from_json_keyfile_name(config.client_secret_calendar, 'https://www.googleapis.com/auth/calendar.readonly')
-        http = credentials.authorize(httplib2.Http())
-        service = discovery.build('calendar', 'v3', http=http)
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
 
-        now = datetime.datetime.utcnow().isoformat() + 'Z'
-        now_1day = round(time.time())+86400
-        now_1day = datetime.datetime.fromtimestamp(now_1day).isoformat() + 'Z'
+con = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+con.row_factory = dict_factory
+cur = con.cursor()
+cur.execute("create table events_tab (id text, created timestamp, updated timestamp, start timestamp, end timestamp, summary text, description text, notified text)")
 
-        eventsResult = service.events().list(
-            calendarId=config.gcalendar_id, timeMin=now, timeMax=now_1day, maxResults=100, singleEvents=True,
-            orderBy='startTime').execute()
-        events = eventsResult.get('items', [])
+def modify_events():
 
-        if not events:
-            print('There are no events today')
-            bot.send_message(config.tg_chat_id, 'There are no events today')
-        else:
-            msg = '<b>There is event today</b>\n'
-            for event in events:
-                start = event['start'].get('dateTime', event['start'].get('date'))
+    print(onoma + ': check for new events')
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    from_events_result = service.events().list(
+        calendarId=config.gcalendar_id, timeMin=now, singleEvents=True,
+        orderBy='startTime').execute()
+    events = from_events_result.get('items', [])
+    if not events:
+        print(onoma + ': no upcoming events in calendar')
+    else:
+        for event in events:
+            event_id = event['id']
+            cur.execute("select id from events_tab where id=:event_id", {
+                        "event_id": event_id})
+            if not cur.fetchall():
                 if "summary" not in event:
-                    ev_title = 'No name'
-                    print(ev_title)
+                    event_summary = 'No name'
                 else:
-                    print(start,' ', event['summary'])
-                    ev_title = event['summary']
+                    event_summary = event['summary']
                 if "description" not in event:
-                    ev_desc = 'No description'
-                    print(ev_desc)
+                    event_description = 'No description'
                 else:
-                    print(event['description'])
-                    ev_desc = event['description']
+                    event_description = event['description']
+                event_created = event['created']
+                event_created = dt.fromisoformat(event_created.replace('Z', ''))
+                event_created = event_created.strftime('%Y-%m-%d %H:%M:%S')
+                event_updated = event['updated']
+                event_updated = dt.fromisoformat(event_updated.replace('Z', ''))
+                event_updated = event_updated.strftime('%Y-%m-%d %H:%M:%S')
+                event_start = event['start']['dateTime']
+                event_start = dt.fromisoformat(event_start.replace('Z', ''))
+                event_start = event_start.strftime('%Y-%m-%d %H:%M:%S')
+                event_end = event['end']['dateTime']
+                event_end = dt.fromisoformat(event_end.replace('Z', ''))
+                event_end = event_end.strftime('%Y-%m-%d %H:%M:%S')
 
-                
-                cal_link = '<a href="/%s">More...</a>'%event['htmlLink']
-                ev_start = event['start'].get('dateTime')
-                print (cal_link)
-                msg = msg+'%s\n%s\n%s\n%s\n\n'%(ev_title, ev_start, ev_desc, cal_link)
-                print('===================================================================')
-            bot.send_message(config.tg_chat_id, msg, parse_mode='HTML')
+                print(onoma + ': inserting new event ' + event['id'], event_created, event_updated, event_start, event_end, event_summary, event_description)
+                cur.execute("insert into events_tab (id, created, updated, start, end, summary, description, notified) values (?, ?, ?, ?, ?, ?, ?, ?)", (
+                    event['id'], event_created, event_updated, event_start, event_end, event_summary, event_description, 'no'))
+                con.commit()
+            else:
+                print(onoma + ': event ' + event['id'] + ' already in database')
 
-    if __name__ == '__main__':
-        main()
+def today_events():
+    print(onoma + ': check for today events')
+    cur.execute(
+        "select * from events_tab where datetime(start) >= date('now')")
+    if not cur.fetchall():
+        print(onoma + ': there is no events today(tonight)')
+        bot.send_message(config.tg_chat_id, 'There is no events today(tonight)')
+    else:
+        cur.execute(
+            "select * from events_tab where datetime(start) >= date('now')")
+        today_events_dict = (cur.fetchall())
+        msg = '<b>There is ' + str(len(today_events_dict)) + ' upcoming event(s) today(tonight):</b>\n\n'
+        for event in today_events_dict:
+            msg = msg+'%s\n%s\n%s\n\n'%(event['summary'], event['start'], event['description'])
+        print(onoma + ': sending message\n' + msg)
+        bot.send_message(config.tg_chat_id, msg, parse_mode='HTML')
 
-print('Listening ...')
-schedule.every(1).seconds.do(job)
-#schedule.every().hour.do(job)
-#schedule.every().day.at("11:15").do(job)
-#schedule.every().monday.do(job)
-#schedule.every().wednesday.at("13:15").do(job)
+def upcoming_events():
+    print(onoma + ': check for upcoming events')
+    cur.execute(
+        "select * from events_tab where datetime(start) >= datetime('now', 'localtime', '-15 minutes') and notified = 'no'")
+    if not cur.fetchall():
+        print(onoma + ': there is no upcoming events')
+    else:
+        cur.execute(
+            "select * from events_tab where datetime(start) >= datetime('now', 'localtime', '-15 minutes') and notified = 'no'")
+        upcoming_events_dict = (cur.fetchall())
+        msg = '<b>Event starting in 15 minutes:</b>\n\n'
+        for event in upcoming_events_dict:
+            msg = msg+'%s\n%s\n%s\n\n'%(event['summary'], event['start'], event['description'])
+            cur.execute("update events_tab set notified = 'yes' where id=:event_id", {"event_id": event['id']})
+            con.commit()
+        print(onoma + ': sending message\n' + msg)
+        bot.send_message(config.tg_chat_id, msg, parse_mode='HTML')
+
+print(onoma + ': let me take the burden of routine reminders upon myself')
+schedule.every(1).minute.do(modify_events)
+schedule.every(1).minute.do(upcoming_events)
+schedule.every().day.at("20:08").do(today_events)
 
 while True:
     schedule.run_pending()
